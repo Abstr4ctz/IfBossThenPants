@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: IfBossThenPants
+## Notes: Auto-queues gear changes on specific events.
+## Author: Abstractz
+## Version: 1.1
+## SavedVariablesPerCharacter: IfBossThenPantsDB
+
+IfBossThenPants.lua
