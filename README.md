@@ -5,20 +5,31 @@ A mob-event-based gear automation addon for World of Warcraft 1.12.1. It automat
 
 ## What does it do?
 It monitors **Mob Death** and **Target Change** events. When a matching Mob Name or GUID is detected, it equips specified items to specified slots.
-*   **In Combat:** The swap is queued and executes immediately upon leaving combat.
+*   **In Combat:** The swap is usually queued and executes immediately upon leaving combat. **Exception:** Weapons (Main/Off/Ranged) can be forced to swap during combat using the optional combat flag.
 *   **Out of Combat:** The swap happens instantly.
 *   **Optimization:** It checks equipped items first. If the item is already in the correct slot, no action is taken.
 
 ## Use Cases
 *   **Resistance Gear:** Automatically equip resistance items when targeting specific mobs.
 *   **Item Swapping:** Equip items like "Carrot on a Stick" instantly when a boss dies.
-*   **Weapon Swapping:** Switch weapons based on the specific enemy you are targeting.
+*   **Weapon Swapping:** Switch weapons mid-combat (requires explicit config) or out of combat based on the specific enemy you are targeting.
 
 ## Usage & Commands
 
 All commands start with `/ibtp`.
 
-### 1. The "Identifier"
+### 1. General Controls
+
+```bash
+# Enable or Disable the addon
+# When disabled, no events are scanned and no gear is swapped.
+/ibtp toggle
+
+# List all active rules
+/ibtp list
+```
+
+### 2. The "Identifier"
 When adding rules, you must identify the mob. You can do this in three ways:
 1.  **Name:** Type the name manually (e.g., `Ragnaros`).
 2.  **GUID:** Type the hex ID manually (e.g., `0xF130000123`).
@@ -26,8 +37,8 @@ When adding rules, you must identify the mob. You can do this in three ways:
     *   *Standard Client:* Saves the target's Name.
     *   *SuperWoW:* Saves the target's GUID (allows you to distinguish between mobs with the same name).
 
-### 2. Scenario A: Swap on Death
-Triggers when the mob dies. Useful for equipping travel gear after a boss or swapping trinkets between trash packs.
+### 3. Scenario A: Swap on Death
+Triggers when the mob dies. Useful for equipping regen gear after a boss or swapping trinkets between trash packs.
 
 ```bash
 # Syntax
@@ -40,7 +51,7 @@ Triggers when the mob dies. Useful for equipping travel gear after a boss or swa
 /ibtp adddeath target - Hand of Justice
 ```
 
-### 3. Scenario B: Swap on Target
+### 4. Scenario B: Swap on Target
 Triggers immediately when you click or tab to a specific unit.
 
 ```bash
@@ -51,12 +62,27 @@ Triggers immediately when you click or tab to a specific unit.
 /ibtp addtarget Baron Geddon - Draconian Deflector - 17
 ```
 
-### 4. Removal & Lists
+### 5. In-Combat Weapon Swapping (Optional)
+By default, the addon queues swaps until you leave combat. You can force an **immediate** swap during combat by adding `- combat` to the end of the command.
+
+**Restrictions:**
+*   You must specify the slot ID.
+*   The slot ID must be **16** (Main Hand), **17** (Off Hand/Shield), or **18** (Ranged).
 
 ```bash
-# List all active rules
-/ibtp list
+# Syntax
+/ibtp addtarget [Identifier] - [Item Name] - [Slot] - combat
 
+# Example: Equip "Thunderfury" immediately when Ragnaros dies, even if in combat
+/ibtp adddeath Ragnaros - Thunderfury - 16 - combat
+
+# Example: Equip "Elementium Reinforced Bulwark" immediately when targeting Baron Geddon
+/ibtp addtarget Baron Geddon - Elementium Reinforced Bulwark - 17 - combat
+```
+
+### 6. Removal
+
+```bash
 # Remove a rule (Must match the Name/GUID exactly as listed)
 /ibtp remdeath Ragnaros - Carrot on a Stick
 /ibtp remtarget Baron Geddon - Draconian Deflector
@@ -67,6 +93,7 @@ You can edit the database directly by closing the game and opening: `WTF\Account
 
 ```lua
 IfBossThenPantsDB = {
+    ["enabled"] = true,
     ["onMobDeath"] = {
         ["ragnaros"] = {
             { ["name"] = "Carrot on a Stick", ["slot"] = 13 }
@@ -74,7 +101,8 @@ IfBossThenPantsDB = {
     },
     ["onTarget"] = {
         ["0xf130008f5e026920"] = { -- SuperWoW GUID example
-            { ["name"] = "Draconian Deflector", ["slot"] = 17 }
+            -- Note the combat flag here
+            { ["name"] = "Draconian Deflector", ["slot"] = 17, ["combat"] = true }
         }
     }
 }
@@ -83,25 +111,25 @@ IfBossThenPantsDB = {
 ## Slot IDs
 You can use the slot number ID or the alias.
 
-| Slot Name | ID | Alias |
-| :--- | :--- | :--- |
-| **Head** | 1 | head |
-| **Neck** | 2 | neck |
-| **Shoulder** | 3 | shoulder |
-| **Back** | 15 | cloak |
-| **Chest** | 5 | chest |
-| **Wrist** | 9 | wrist |
-| **Hands** | 10 | hands |
-| **Waist** | 6 | waist |
-| **Legs** | 7 | legs |
-| **Feet** | 8 | feet |
-| **Finger 1** | 11 | ring1 |
-| **Finger 2** | 12 | ring2 |
-| **Trinket 1** | 13 | trinket1 |
-| **Trinket 2** | 14 | trinket2 |
-| **Main Hand** | 16 | mainhand, mh |
-| **Off Hand** | 17 | offhand, oh, shield |
-| **Ranged** | 18 | ranged |
+| Slot Name | ID | Alias | Combat Swap? |
+| :--- | :--- | :--- | :--- |
+| **Head** | 1 | head | No |
+| **Neck** | 2 | neck | No |
+| **Shoulder** | 3 | shoulder | No |
+| **Back** | 15 | cloak | No |
+| **Chest** | 5 | chest | No |
+| **Wrist** | 9 | wrist | No |
+| **Hands** | 10 | hands | No |
+| **Waist** | 6 | waist | No |
+| **Legs** | 7 | legs | No |
+| **Feet** | 8 | feet | No |
+| **Finger 1** | 11 | ring1 | No |
+| **Finger 2** | 12 | ring2 | No |
+| **Trinket 1** | 13 | trinket1 | No |
+| **Trinket 2** | 14 | trinket2 | No |
+| **Main Hand** | 16 | mainhand, mh | **Yes** |
+| **Off Hand** | 17 | offhand, oh, shield | **Yes** |
+| **Ranged** | 18 | ranged | **Yes** |
 
 ## GUIDs
 You can find some mob guids for popular raids [here](https://github.com/MarcelineVQ/AutoMarker/blob/master/NPCList.lua).

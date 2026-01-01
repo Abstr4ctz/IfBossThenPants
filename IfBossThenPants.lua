@@ -1,6 +1,6 @@
 -- ==========================================================================
 -- Addon: IfBossThenPants
--- Version: 1.1
+-- Version: 1.2
 -- Description: Automates gear switching based on Mob Death or Target Change.
 --              Supports Standard Clients (Names) & SuperWoW (GUIDs).
 -- ==========================================================================
@@ -14,16 +14,28 @@ local frame = CreateFrame("Frame")
 -- Localizing global functions prevents hash table lookups every frame.
 -- ==========================================================================
 local _G = getfenv(0)
+
+-- String & Table
 local strlower = string.lower
 local strfind  = string.find
+local strsub   = string.sub
+local gsub     = string.gsub
 local tinsert  = table.insert
 local tremove  = table.remove
 local getn     = table.getn
 
+-- WoW API
 local UnitName            = UnitName
 local UnitExists          = UnitExists
 local UnitIsDeadOrGhost   = UnitIsDeadOrGhost
 local UnitAffectingCombat = UnitAffectingCombat
+local GetInventoryItemLink = GetInventoryItemLink
+local GetContainerNumSlots = GetContainerNumSlots
+local GetContainerItemLink = GetContainerItemLink
+local PickupInventoryItem  = PickupInventoryItem
+local EquipCursorItem      = EquipCursorItem
+local PickupContainerItem  = PickupContainerItem
+local UseContainerItem     = UseContainerItem
 
 -- ==========================================================================
 -- CONSTANTS & STATE
@@ -61,7 +73,20 @@ end
 
 function IfBossThenPants:Trim(s)
     if not s then return nil end
-    return string.gsub(s, "^%s*(.-)%s*$", "%1")
+    return gsub(s, "^%s*(.-)%s*$", "%1")
+end
+
+function IfBossThenPants:SplitString(str, delim)
+    local res = {}
+    local start = 1
+    local delim_from, delim_to = strfind(str, delim, start)
+    while delim_from do
+        tinsert(res, strsub(str, start, delim_from - 1))
+        start = delim_to + 1
+        delim_from, delim_to = strfind(str, delim, start)
+    end
+    tinsert(res, strsub(str, start))
+    return res
 end
 
 -- ==========================================================================
@@ -72,15 +97,18 @@ function IfBossThenPants:InitializeDB()
     if not IfBossThenPantsDB then
         IfBossThenPantsDB = {
             onMobDeath = {}, -- Key: Name or GUID
-            onTarget   = {}  -- Key: Name or GUID
+            onTarget   = {}, -- Key: Name or GUID
+            enabled    = true
         }
     end
+    
     -- Integrity checks
     if not IfBossThenPantsDB.onMobDeath then IfBossThenPantsDB.onMobDeath = {} end
     if not IfBossThenPantsDB.onTarget then IfBossThenPantsDB.onTarget = {} end
+    if IfBossThenPantsDB.enabled == nil then IfBossThenPantsDB.enabled = true end
 end
 
-function IfBossThenPants:AddEntry(category, key, displayLabel, item, slotName)
+function IfBossThenPants:AddEntry(category, key, displayLabel, item, slotName, allowCombat)
     local dbTable = (category == "death") and IfBossThenPantsDB.onMobDeath or IfBossThenPantsDB.onTarget
     local label   = (category == "death") and "On Death" or "On Target"
     local dbKey   = strlower(key)
@@ -94,11 +122,23 @@ function IfBossThenPants:AddEntry(category, key, displayLabel, item, slotName)
         else
             slotID = self.slotMap[strlower(slotName)]
         end
+    end
 
+    -- Validation for Combat Swapping
+    if allowCombat then
         if not slotID then
-            self:Print("Error: Invalid slot '" .. slotName .. "'.")
+            self:Print("Error: You must specify a Slot ID (16, 17, or 18) to use the '- combat' option.")
             return
         end
+        if slotID ~= 16 and slotID ~= 17 and slotID ~= 18 then
+            self:Print("Error: Combat swapping is ONLY available for slots 16 (MainHand), 17 (OffHand), and 18 (Ranged).")
+            return
+        end
+    end
+
+    if not slotID and slotName then
+        self:Print("Error: Invalid slot '" .. slotName .. "'.")
+        return
     end
 
     if not dbTable[dbKey] then dbTable[dbKey] = {} end
@@ -123,10 +163,11 @@ function IfBossThenPants:AddEntry(category, key, displayLabel, item, slotName)
     end
 
     -- 3. Store Entry
-    tinsert(dbTable[dbKey], { name = item, slot = slotID })
+    tinsert(dbTable[dbKey], { name = item, slot = slotID, combat = allowCombat })
     
-    local slotMsg = slotName and (" (Slot: " .. slotID .. ")") or " (Auto Slot)"
-    self:Print(label .. ": Added [" .. item .. "]" .. slotMsg .. " to [" .. displayLabel .. "]")
+    local slotMsg = slotID and (" (Slot: " .. slotID .. ")") or " (Auto Slot)"
+    local combatMsg = allowCombat and " |cffff0000[Combat Swap]|r" or ""
+    self:Print(label .. ": Added [" .. item .. "]" .. slotMsg .. combatMsg .. " to [" .. displayLabel .. "]")
 end
 
 function IfBossThenPants:RemoveEntry(category, key, item)
@@ -159,7 +200,8 @@ function IfBossThenPants:RemoveEntry(category, key, item)
 end
 
 function IfBossThenPants:ListEntries()
-    self:Print("--- Configuration ---")
+    local status = IfBossThenPantsDB.enabled and "|cff00ff00ON|r" or "|cffff0000OFF|r"
+    self:Print("--- Configuration (Status: " .. status .. ") ---")
     
     local function PrintTable(tbl, title)
         self:Print(title)
@@ -169,6 +211,7 @@ function IfBossThenPants:ListEntries()
             for _, entry in ipairs(items) do
                 local s = entry.name
                 if entry.slot then s = s .. "(" .. entry.slot .. ")" end
+                if entry.combat then s = s .. "|cffff0000(C)|r" end
                 itemStr = itemStr .. "[" .. s .. "] "
             end
             self:Print("  " .. key .. " -> " .. itemStr)
@@ -185,7 +228,7 @@ end
 -- CORE LOGIC: EQUIPMENT SWAPPING
 -- ==========================================================================
 
--- itemObj format: { name="Sulfuras", slot=16 (optional) }
+-- itemObj format: { name="Sulfuras", slot=16, combat=true/false }
 function IfBossThenPants:ScanAndEquip(itemObj)
     -- Safety Check: Do not attempt to swap gear if dead
     if UnitIsDeadOrGhost("player") then return false end
@@ -195,8 +238,6 @@ function IfBossThenPants:ScanAndEquip(itemObj)
     -- ============================================================
     -- PHASE 1: CHECK EQUIPPED GEAR (Priority)
     -- ============================================================
-    -- We check the body first. If it's already equipped correctly,
-    -- we do nothing to save actions and processing.
     for invSlot = 0, 19 do
         local link = GetInventoryItemLink("player", invSlot)
         if link then
@@ -225,7 +266,6 @@ function IfBossThenPants:ScanAndEquip(itemObj)
     -- ============================================================
     -- PHASE 2: CHECK BAGS (Fallback)
     -- ============================================================
-    -- Only look in bags if we didn't find it equipped.
     for bag = 0, 4 do
         local slots = GetContainerNumSlots(bag)
         if slots > 0 then
@@ -255,11 +295,17 @@ end
 
 function IfBossThenPants:QueueItem(itemObj)
     if self.inCombat then
-        -- Avoid duplicate queueing
-        for _, queued in ipairs(self.itemQueue) do
-            if queued.name == itemObj.name and queued.slot == itemObj.slot then return end
+        -- Check if this specific item allows combat swapping (Weapons/Ranged only)
+        if itemObj.combat and itemObj.slot and (itemObj.slot == 16 or itemObj.slot == 17 or itemObj.slot == 18) then
+            -- Attempt immediate swap
+            self:ScanAndEquip(itemObj)
+        else
+            -- Standard Queue logic: Avoid duplicate queueing
+            for _, queued in ipairs(self.itemQueue) do
+                if queued.name == itemObj.name and queued.slot == itemObj.slot then return end
+            end
+            tinsert(self.itemQueue, itemObj)
         end
-        tinsert(self.itemQueue, itemObj)
     else
         self:ScanAndEquip(itemObj)
     end
@@ -290,17 +336,31 @@ function IfBossThenPants:SlashHandler(msg)
     local _, _, cmd, rest = strfind(msg, "^%s*(%w+)%s*(.*)$")
     
     if not cmd then
+        self:Print("Status: " .. (IfBossThenPantsDB.enabled and "|cff00ff00ON|r" or "|cffff0000OFF|r"))
         self:Print("Commands:")
+        self:Print("  /ibtp toggle - Enable/Disable addon")
         self:Print("  /ibtp list")
-        self:Print("  /ibtp adddeath Identifier - Item - [Slot]")
+        self:Print("  /ibtp adddeath Identifier - Item - [Slot] - [combat]")
         self:Print("  /ibtp remdeath Identifier - Item")
-        self:Print("  /ibtp addtarget Identifier - Item - [Slot]")
+        self:Print("  /ibtp addtarget Identifier - Item - [Slot] - [combat]")
         self:Print("  /ibtp remtarget Identifier - Item")
         self:Print("  * Identifier can be a Name, a GUID, or 'target'")
+        self:Print("  * Add '- combat' at the end to force swap in combat (Slots 16/17/18 only)")
         return
     end
 
     cmd  = strlower(cmd)
+    
+    if cmd == "toggle" then
+        IfBossThenPantsDB.enabled = not IfBossThenPantsDB.enabled
+        if IfBossThenPantsDB.enabled then
+            self:Print("Addon is now |cff00ff00ENABLED|r.")
+        else
+            self:Print("Addon is now |cffff0000DISABLED|r. Events will not be scanned.")
+        end
+        return
+    end
+
     rest = self:Trim(rest)
 
     if cmd == "list" then
@@ -310,20 +370,37 @@ function IfBossThenPants:SlashHandler(msg)
     
     if cmd == "adddeath" or cmd == "remdeath" or cmd == "addtarget" or cmd == "remtarget" then
         
-        -- Parse: Identifier - Item - [Slot]
-        local _, _, identifier, item, slot = strfind(rest, "^(.-)%s*-%s*(.-)%s*-%s*(.*)$")
-        if not identifier then
-            _, _, identifier, item = strfind(rest, "^(.-)%s*-%s*(.*)$")
-            slot = nil
+        -- Split arguments by hyphen
+        local args = self:SplitString(rest, "-")
+        for i=1, getn(args) do args[i] = self:Trim(args[i]) end
+
+        if getn(args) < 2 then
+             self:Print("Usage: /ibtp " .. cmd .. " Identifier - Item - [Slot] - [combat]")
+             return
         end
 
-        identifier = self:Trim(identifier)
-        item       = self:Trim(item)
-        slot       = self:Trim(slot)
+        local identifier = args[1]
+        local item       = args[2]
+        local slot       = nil
+        local allowCombat = false
 
-        if not identifier or not item or identifier == "" or item == "" then
-            self:Print("Usage: /ibtp " .. cmd .. " Identifier - Item")
-            return
+        -- Parse 3rd and 4th arguments dynamically
+        if getn(args) >= 3 then
+            local arg3 = strlower(args[3])
+            
+            if arg3 == "combat" then
+                allowCombat = true
+                -- Slot remains nil (will trigger validation error later if combat is true)
+            else
+                slot = args[3]
+            end
+        end
+
+        if getn(args) >= 4 then
+            local arg4 = strlower(args[4])
+            if arg4 == "combat" then
+                allowCombat = true
+            end
         end
 
         local finalKey = identifier
@@ -337,9 +414,7 @@ function IfBossThenPants:SlashHandler(msg)
             end
             
             if self.isSuperWoW then
-                -- SuperWoW UnitExists returns: boolean, GUID
                 local _, guid = UnitExists("target")
-                
                 if guid then
                     finalKey = guid
                     display  = "GUID:" .. finalKey .. " (" .. UnitName("target") .. ")"
@@ -357,7 +432,7 @@ function IfBossThenPants:SlashHandler(msg)
         local isAdd    = (strfind(cmd, "add"))   and true    or false
         
         if isAdd then
-            self:AddEntry(category, finalKey, display, item, slot)
+            self:AddEntry(category, finalKey, display, item, slot, allowCombat)
         else
             self:RemoveEntry(category, finalKey, item)
         end
@@ -371,13 +446,17 @@ end
 -- ==========================================================================
 
 local function EventHandler()
+    -- Global Enable/Disable Check
+    -- Allow ADDON_LOADED to pass so variables get initialized
+    if event ~= "ADDON_LOADED" and IfBossThenPantsDB and not IfBossThenPantsDB.enabled then
+        return
+    end
+
     -- ----------------------------------------------------------------------
     -- SCENARIO: MOB DEATH
     -- ----------------------------------------------------------------------
     if event == EVT_RAW then
-        -- O(1) String comparison
         if arg1 == EVT_DEATH then
-            -- Only regex if event matches. Finds GUID hex string.
             local _, _, guid = strfind(arg2, "(0x%x+)")
             if guid then
                 local list = IfBossThenPantsDB.onMobDeath[strlower(guid)]
@@ -393,9 +472,6 @@ local function EventHandler()
     -- SCENARIO: TARGET CHANGE
     -- ----------------------------------------------------------------------
     if event == EVT_TARGET then
-        -- Single API call to check existence and retrieve GUID (if SuperWoW)
-        -- Vanilla: returns 1, nil
-        -- SuperWoW: returns 1, GUID
         local exists, guid = UnitExists("target")
         
         if exists then
