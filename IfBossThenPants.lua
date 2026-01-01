@@ -1,8 +1,10 @@
 -- ==========================================================================
 -- Addon: IfBossThenPants
--- Version: 1.2
+-- Version: 1.3.4
 -- Description: Automates gear switching based on Mob Death or Target Change.
 --              Supports Standard Clients (Names) & SuperWoW (GUIDs).
+--              Supports Individual Items and External Gear Sets (Outfitter/ItemRack).
+--              Handles Combat Queueing and Post-Resurrection Swapping.
 -- ==========================================================================
 
 -- Namespace Definition
@@ -22,13 +24,14 @@ local strsub   = string.sub
 local gsub     = string.gsub
 local tinsert  = table.insert
 local tremove  = table.remove
+local tsort    = table.sort
 local getn     = table.getn
 
 -- WoW API
-local UnitName            = UnitName
-local UnitExists          = UnitExists
-local UnitIsDeadOrGhost   = UnitIsDeadOrGhost
-local UnitAffectingCombat = UnitAffectingCombat
+local UnitName             = UnitName
+local UnitExists           = UnitExists
+local UnitIsDeadOrGhost    = UnitIsDeadOrGhost
+local UnitAffectingCombat  = UnitAffectingCombat
 local GetInventoryItemLink = GetInventoryItemLink
 local GetContainerNumSlots = GetContainerNumSlots
 local GetContainerItemLink = GetContainerItemLink
@@ -36,6 +39,7 @@ local PickupInventoryItem  = PickupInventoryItem
 local EquipCursorItem      = EquipCursorItem
 local PickupContainerItem  = PickupContainerItem
 local UseContainerItem     = UseContainerItem
+local IsAddOnLoaded        = IsAddOnLoaded
 
 -- ==========================================================================
 -- CONSTANTS & STATE
@@ -90,6 +94,43 @@ function IfBossThenPants:SplitString(str, delim)
 end
 
 -- ==========================================================================
+-- EXTERNAL ADDON INTEGRATION HANDLERS
+-- ==========================================================================
+
+local IntegrationHandlers = {
+    ["itemrack"] = function(setName)
+        -- Method 1: Direct API
+        if type(ItemRack_EquipSet) == "function" then
+            ItemRack_EquipSet(setName)
+            return true
+        end
+        -- Method 2: Slash Command Fallback
+        if SlashCmdList["ITEMRACK"] then
+            SlashCmdList["ITEMRACK"]("equip " .. setName)
+            return true
+        end
+        return false
+    end,
+
+    ["outfitter"] = function(setName)
+        -- Method 1: Direct API
+        if _G["Outfitter"] and _G["Outfitter"].FindOutfitByName and _G["Outfitter"].WearOutfit then
+            local outfit = _G["Outfitter"]:FindOutfitByName(setName)
+            if outfit then
+                _G["Outfitter"]:WearOutfit(outfit)
+                return true
+            end
+        end
+        -- Method 2: Slash Command Fallback
+        if SlashCmdList["OUTFITTER"] then
+            SlashCmdList["OUTFITTER"]("wear " .. setName)
+            return true
+        end
+        return false
+    end
+}
+
+-- ==========================================================================
 -- DATABASE MANAGEMENT
 -- ==========================================================================
 
@@ -102,72 +143,103 @@ function IfBossThenPants:InitializeDB()
         }
     end
     
-    -- Integrity checks
     if not IfBossThenPantsDB.onMobDeath then IfBossThenPantsDB.onMobDeath = {} end
     if not IfBossThenPantsDB.onTarget then IfBossThenPantsDB.onTarget = {} end
     if IfBossThenPantsDB.enabled == nil then IfBossThenPantsDB.enabled = true end
 end
 
-function IfBossThenPants:AddEntry(category, key, displayLabel, item, slotName, allowCombat)
+-- objType: "item" or "set"
+-- addonName: "itemrack" or "outfitter" (only if objType is set)
+function IfBossThenPants:AddEntry(category, key, displayLabel, item, slotName, allowCombat, objType, addonName)
     local dbTable = (category == "death") and IfBossThenPantsDB.onMobDeath or IfBossThenPantsDB.onTarget
     local label   = (category == "death") and "On Death" or "On Target"
     local dbKey   = strlower(key)
+    local slotID  = nil
     
-    -- Resolve Slot ID
-    local slotID = nil
-    if slotName then
-        local numericSlot = tonumber(slotName)
-        if numericSlot then
-            slotID = numericSlot
-        else
-            slotID = self.slotMap[strlower(slotName)]
+    -- 1. Validate Inputs
+    if objType == "item" then
+        if slotName then
+            local numericSlot = tonumber(slotName)
+            if numericSlot then
+                slotID = numericSlot
+            else
+                slotID = self.slotMap[strlower(slotName)]
+            end
         end
-    end
 
-    -- Validation for Combat Swapping
-    if allowCombat then
-        if not slotID then
-            self:Print("Error: You must specify a Slot ID (16, 17, or 18) to use the '- combat' option.")
+        -- Validation for Combat Swapping (Items only)
+        if allowCombat then
+            if not slotID then
+                self:Print("Error: You must specify a Slot ID (16, 17, or 18) to use the '- combat' option.")
+                return
+            end
+            if slotID ~= 16 and slotID ~= 17 and slotID ~= 18 then
+                self:Print("Error: Combat swapping is ONLY available for slots 16, 17, and 18.")
+                return
+            end
+        end
+
+        if not slotID and slotName then
+            self:Print("Error: Invalid slot '" .. slotName .. "'.")
             return
         end
-        if slotID ~= 16 and slotID ~= 17 and slotID ~= 18 then
-            self:Print("Error: Combat swapping is ONLY available for slots 16 (MainHand), 17 (OffHand), and 18 (Ranged).")
+    elseif objType == "set" then
+        if allowCombat then
+            self:Print("Error: External Gear Sets cannot be swapped in combat.")
             return
         end
-    end
-
-    if not slotID and slotName then
-        self:Print("Error: Invalid slot '" .. slotName .. "'.")
-        return
+        slotID = nil
     end
 
     if not dbTable[dbKey] then dbTable[dbKey] = {} end
 
-    -- 1. Check for Exact Duplicates (Name + Slot)
+    -- 2. Duplicate & Conflict Check
     local itemLower = strlower(item)
-    for _, v in ipairs(dbTable[dbKey]) do
-        if strlower(v.name) == itemLower and v.slot == slotID then
-            self:Print(label .. ": Item [" .. item .. "] already listed for [" .. displayLabel .. "]")
+    local mixedTypesDetected = false
+
+    for i, v in ipairs(dbTable[dbKey]) do
+        local entryType = v.type or "item" -- Backward compatibility
+        
+        if entryType == objType and strlower(v.name) == itemLower and v.slot == slotID then
+            self:Print(label .. ": [" .. item .. "] already listed for [" .. displayLabel .. "]")
             return
         end
-    end
 
-    -- 2. Overwrite Check: If slot is specified, remove old item for that slot
-    if slotID then
-        for i, v in ipairs(dbTable[dbKey]) do
-            if v.slot == slotID then
-                tremove(dbTable[dbKey], i)
-                break
-            end
+        if entryType ~= objType then
+            mixedTypesDetected = true
+        end
+
+        -- Overwrite Check (Only for Items sharing a slot)
+        if objType == "item" and entryType == "item" and slotID and v.slot == slotID then
+            tremove(dbTable[dbKey], i)
+            break
         end
     end
 
     -- 3. Store Entry
-    tinsert(dbTable[dbKey], { name = item, slot = slotID, combat = allowCombat })
+    tinsert(dbTable[dbKey], { 
+        name   = item, 
+        slot   = slotID, 
+        combat = allowCombat,
+        type   = objType,
+        addon  = addonName
+    })
     
-    local slotMsg = slotID and (" (Slot: " .. slotID .. ")") or " (Auto Slot)"
-    local combatMsg = allowCombat and " |cffff0000[Combat Swap]|r" or ""
-    self:Print(label .. ": Added [" .. item .. "]" .. slotMsg .. combatMsg .. " to [" .. displayLabel .. "]")
+    -- 4. Feedback
+    local extraInfo = ""
+    if objType == "item" then
+        extraInfo = slotID and (" (Slot: " .. slotID .. ")") or " (Auto Slot)"
+        if allowCombat then extraInfo = extraInfo .. " |cffff0000[Combat]|r" end
+    else
+        extraInfo = " |cffFFFF00[Set: " .. addonName .. "]|r"
+    end
+
+    self:Print(label .. ": Added [" .. item .. "]" .. extraInfo .. " to [" .. displayLabel .. "]")
+
+    if mixedTypesDetected then
+        self:Print("|cffff0000Warning:|r You are mixing a Gear Set with individual items for this target.")
+        self:Print("The Set will be equipped first, followed by items.")
+    end
 end
 
 function IfBossThenPants:RemoveEntry(category, key, item)
@@ -195,7 +267,7 @@ function IfBossThenPants:RemoveEntry(category, key, item)
         self:Print(label .. ": Removed [" .. item .. "]")
         if getn(dbTable[dbKey]) == 0 then dbTable[dbKey] = nil end
     else
-        self:Print(label .. ": Item [" .. item .. "] not found.")
+        self:Print(label .. ": Item/Set [" .. item .. "] not found.")
     end
 end
 
@@ -210,8 +282,15 @@ function IfBossThenPants:ListEntries()
             local itemStr = ""
             for _, entry in ipairs(items) do
                 local s = entry.name
-                if entry.slot then s = s .. "(" .. entry.slot .. ")" end
-                if entry.combat then s = s .. "|cffff0000(C)|r" end
+                local eType = entry.type or "item"
+                
+                if eType == "item" then
+                    if entry.slot then s = s .. "(" .. entry.slot .. ")" end
+                    if entry.combat then s = s .. "|cffff0000(C)|r" end
+                else
+                    s = s .. "|cffFFFF00(Set)|r"
+                end
+                
                 itemStr = itemStr .. "[" .. s .. "] "
             end
             self:Print("  " .. key .. " -> " .. itemStr)
@@ -228,33 +307,44 @@ end
 -- CORE LOGIC: EQUIPMENT SWAPPING
 -- ==========================================================================
 
--- itemObj format: { name="Sulfuras", slot=16, combat=true/false }
+function IfBossThenPants:EquipSet(addon, setName)
+    local handler = IntegrationHandlers[addon]
+    if handler then
+        if handler(setName) then
+            self:Print("Equipping " .. addon .. " set: " .. setName)
+            return true
+        end
+    end
+    self:Print("Error: Failed to equip " .. addon .. " set '" .. setName .. "'.")
+    return false
+end
+
 function IfBossThenPants:ScanAndEquip(itemObj)
-    -- Safety Check: Do not attempt to swap gear if dead
+    -- Safety: Do not attempt to physically swap if dead (Queue handles this, but this is a failsafe)
     if UnitIsDeadOrGhost("player") then return false end
 
+    -- 1. Handle SETS
+    if itemObj.type == "set" then
+        return self:EquipSet(itemObj.addon, itemObj.name)
+    end
+
+    -- 2. Handle ITEMS
     local targetLower = strlower(itemObj.name)
     
-    -- ============================================================
-    -- PHASE 1: CHECK EQUIPPED GEAR (Priority)
-    -- ============================================================
+    -- Phase A: Check Currently Equipped
     for invSlot = 0, 19 do
         local link = GetInventoryItemLink("player", invSlot)
         if link then
             local _, _, itemName = strfind(link, "%[(.+)%]")
             if itemName and strlower(itemName) == targetLower then
                 
-                -- CASE A: It is currently in the requested slot
-                if itemObj.slot and invSlot == itemObj.slot then
-                    return true -- SUCCESS: Already done, do nothing.
-                end
+                -- It is in the requested slot
+                if itemObj.slot and invSlot == itemObj.slot then return true end
 
-                -- CASE B: No specific slot requested, and it's equipped
-                if not itemObj.slot then
-                    return true -- SUCCESS: Already equipped, do nothing.
-                end
+                -- No slot requested, and it is equipped
+                if not itemObj.slot then return true end
 
-                -- CASE C: It is equipped, but in the wrong slot -> Swap it
+                -- It is equipped, but wrong slot -> Swap
                 PickupInventoryItem(invSlot)
                 EquipCursorItem(itemObj.slot)
                 self:Print("Moving " .. itemName .. " from slot " .. invSlot .. " to " .. itemObj.slot)
@@ -263,9 +353,7 @@ function IfBossThenPants:ScanAndEquip(itemObj)
         end
     end
 
-    -- ============================================================
-    -- PHASE 2: CHECK BAGS (Fallback)
-    -- ============================================================
+    -- Phase B: Check Bags
     for bag = 0, 4 do
         local slots = GetContainerNumSlots(bag)
         if slots > 0 then
@@ -294,19 +382,36 @@ function IfBossThenPants:ScanAndEquip(itemObj)
 end
 
 function IfBossThenPants:QueueItem(itemObj)
-    if self.inCombat then
-        -- Check if this specific item allows combat swapping (Weapons/Ranged only)
-        if itemObj.combat and itemObj.slot and (itemObj.slot == 16 or itemObj.slot == 17 or itemObj.slot == 18) then
-            -- Attempt immediate swap
+    local itemType = itemObj.type or "item"
+    local isDead   = UnitIsDeadOrGhost("player")
+
+    -- Trigger Queue if: In Combat OR Player is Dead/Ghost
+    if self.inCombat or isDead then
+        
+        -- 1. Sets: ALWAYS queue in restricted states
+        if itemType == "set" then
+             -- Prevent duplicates
+             for _, queued in ipairs(self.itemQueue) do
+                if (queued.type == "set") and (queued.name == itemObj.name) then return end
+            end
+            tinsert(self.itemQueue, itemObj)
+            return
+        end
+
+        -- 2. Items:
+        -- If Dead: Must Queue (Cannot swap weapons while ghost)
+        -- If Alive (Combat): Check for Weapon Swap capability
+        if not isDead and itemObj.combat and itemObj.slot and (itemObj.slot == 16 or itemObj.slot == 17 or itemObj.slot == 18) then
             self:ScanAndEquip(itemObj)
         else
-            -- Standard Queue logic: Avoid duplicate queueing
+            -- Standard Queue logic
             for _, queued in ipairs(self.itemQueue) do
                 if queued.name == itemObj.name and queued.slot == itemObj.slot then return end
             end
             tinsert(self.itemQueue, itemObj)
         end
     else
+        -- Safe State -> Immediate Swap
         self:ScanAndEquip(itemObj)
     end
 end
@@ -314,11 +419,18 @@ end
 function IfBossThenPants:ProcessQueue()
     if getn(self.itemQueue) == 0 then return end
     
-    -- Safety: If player died during combat, do not process queue
+    -- If still dead/ghost, do NOT clear the queue. Return and wait for PLAYER_UNGHOST.
     if UnitIsDeadOrGhost("player") then 
-        self.itemQueue = {}
         return 
     end
+
+    -- SORTING: Sets must execute before Individual Items
+    tsort(self.itemQueue, function(a, b)
+        local aIsSet = (a.type == "set")
+        local bIsSet = (b.type == "set")
+        if aIsSet and not bIsSet then return true end
+        return false
+    end)
     
     for _, itemObj in ipairs(self.itemQueue) do
         self:ScanAndEquip(itemObj)
@@ -336,27 +448,30 @@ function IfBossThenPants:SlashHandler(msg)
     local _, _, cmd, rest = strfind(msg, "^%s*(%w+)%s*(.*)$")
     
     if not cmd then
-        self:Print("Status: " .. (IfBossThenPantsDB.enabled and "|cff00ff00ON|r" or "|cffff0000OFF|r"))
-        self:Print("Commands:")
-        self:Print("  /ibtp toggle - Enable/Disable addon")
-        self:Print("  /ibtp list")
-        self:Print("  /ibtp adddeath Identifier - Item - [Slot] - [combat]")
-        self:Print("  /ibtp remdeath Identifier - Item")
-        self:Print("  /ibtp addtarget Identifier - Item - [Slot] - [combat]")
-        self:Print("  /ibtp remtarget Identifier - Item")
-        self:Print("  * Identifier can be a Name, a GUID, or 'target'")
-        self:Print("  * Add '- combat' at the end to force swap in combat (Slots 16/17/18 only)")
+        local status = IfBossThenPantsDB.enabled and "|cff00ff00ON|r" or "|cffff0000OFF|r"
+        self:Print("--- IfBossThenPants Help ---")
+        self:Print("Status: " .. status)
+        self:Print("Usage: /ibtp [command] [args]")
+        self:Print("  toggle : Enable/Disable event scanning.")
+        self:Print("  list   : Show all active rules.")
+        self:Print("  adddeath / addtarget Identifier - Content - [Slot] - [combat]")
+        self:Print("  remdeath / remtarget Identifier - Content")
+        self:Print("Definitions:")
+        self:Print("  * Identifier : Mob Name, GUID, or 'target'.")
+        self:Print("  * Content    : Item Name OR 'ItemRack(SetName)' OR 'Outfitter(SetName)'.")
+        self:Print("  * combat     : Add '- combat' at the end to force immediate swap in combat.")
+        self:Print("                 (Only valid for items in slots 16, 17, 18).")
         return
     end
 
-    cmd  = strlower(cmd)
+    cmd = strlower(cmd)
     
     if cmd == "toggle" then
         IfBossThenPantsDB.enabled = not IfBossThenPantsDB.enabled
         if IfBossThenPantsDB.enabled then
             self:Print("Addon is now |cff00ff00ENABLED|r.")
         else
-            self:Print("Addon is now |cffff0000DISABLED|r. Events will not be scanned.")
+            self:Print("Addon is now |cffff0000DISABLED|r.")
         end
         return
     end
@@ -370,49 +485,68 @@ function IfBossThenPants:SlashHandler(msg)
     
     if cmd == "adddeath" or cmd == "remdeath" or cmd == "addtarget" or cmd == "remtarget" then
         
-        -- Split arguments by hyphen
-        local args = self:SplitString(rest, "-")
-        for i=1, getn(args) do args[i] = self:Trim(args[i]) end
+        -- Split arguments
+        local rawArgs = self:SplitString(rest, "-")
+        local args = {}
+        for _, v in ipairs(rawArgs) do
+            local trimmed = self:Trim(v)
+            if trimmed and trimmed ~= "" then tinsert(args, trimmed) end
+        end
 
         if getn(args) < 2 then
-             self:Print("Usage: /ibtp " .. cmd .. " Identifier - Item - [Slot] - [combat]")
+             self:Print("Usage: /ibtp " .. cmd .. " Identifier - Content")
              return
         end
 
         local identifier = args[1]
-        local item       = args[2]
+        local itemString = args[2]
         local slot       = nil
         local allowCombat = false
 
-        -- Parse 3rd and 4th arguments dynamically
-        if getn(args) >= 3 then
-            local arg3 = strlower(args[3])
-            
-            if arg3 == "combat" then
-                allowCombat = true
-                -- Slot remains nil (will trigger validation error later if combat is true)
+        -- Validation
+        local itemLower = strlower(itemString)
+        if itemLower == "itemrack" or itemLower == "outfitter" then
+             self:Print("Error: Missing set name. Usage: " .. args[2] .. "(SetName)")
+             return
+        end
+
+        -- Parse Type
+        local _, _, addonName, setName = strfind(itemString, "^(%a+)%((.+)%)$")
+        local objType = "item"
+        local finalName = itemString
+
+        if addonName then
+            addonName = strlower(addonName)
+            if addonName == "itemrack" or addonName == "outfitter" then
+                local realAddonName = (addonName == "itemrack") and "ItemRack" or "Outfitter"
+                if not IsAddOnLoaded(realAddonName) then
+                    self:Print("Error: Addon '" .. realAddonName .. "' is not loaded.")
+                    return
+                end
+                objType = "set"
+                finalName = setName
             else
-                slot = args[3]
+                objType = "item" 
             end
         end
 
+        if getn(args) >= 3 then
+            local arg3 = strlower(args[3])
+            if arg3 == "combat" then allowCombat = true else slot = args[3] end
+        end
         if getn(args) >= 4 then
             local arg4 = strlower(args[4])
-            if arg4 == "combat" then
-                allowCombat = true
-            end
+            if arg4 == "combat" then allowCombat = true end
         end
 
         local finalKey = identifier
         local display  = identifier
 
-        -- Handle 'target' keyword
         if strlower(identifier) == "target" then
             if not UnitExists("target") then
                 self:Print("Error: No target selected.")
                 return
             end
-            
             if self.isSuperWoW then
                 local _, guid = UnitExists("target")
                 if guid then
@@ -432,9 +566,9 @@ function IfBossThenPants:SlashHandler(msg)
         local isAdd    = (strfind(cmd, "add"))   and true    or false
         
         if isAdd then
-            self:AddEntry(category, finalKey, display, item, slot, allowCombat)
+            self:AddEntry(category, finalKey, display, finalName, slot, allowCombat, objType, addonName)
         else
-            self:RemoveEntry(category, finalKey, item)
+            self:RemoveEntry(category, finalKey, finalName)
         end
     else
         self:Print("Unknown command: " .. cmd)
@@ -446,14 +580,12 @@ end
 -- ==========================================================================
 
 local function EventHandler()
-    -- Global Enable/Disable Check
-    -- Allow ADDON_LOADED to pass so variables get initialized
     if event ~= "ADDON_LOADED" and IfBossThenPantsDB and not IfBossThenPantsDB.enabled then
         return
     end
 
     -- ----------------------------------------------------------------------
-    -- SCENARIO: MOB DEATH
+    -- SCENARIO: MOB DEATH (SuperWoW GUID)
     -- ----------------------------------------------------------------------
     if event == EVT_RAW then
         if arg1 == EVT_DEATH then
@@ -473,17 +605,13 @@ local function EventHandler()
     -- ----------------------------------------------------------------------
     if event == EVT_TARGET then
         local exists, guid = UnitExists("target")
-        
         if exists then
-            -- 1. GUID Match (SuperWoW)
             if IfBossThenPants.isSuperWoW and guid then
                 local list = IfBossThenPantsDB.onTarget[strlower(guid)]
                 if list then
                     for _, itemObj in ipairs(list) do IfBossThenPants:QueueItem(itemObj) end
                 end
             end
-
-            -- 2. Name Match (Standard/Fallback)
             local targetName = UnitName("target")
             if targetName then
                 local list = IfBossThenPantsDB.onTarget[strlower(targetName)]
@@ -518,6 +646,9 @@ local function EventHandler()
 
     elseif event == "PLAYER_REGEN_DISABLED" then
         IfBossThenPants.inCombat = true
+    
+    elseif event == "PLAYER_UNGHOST" then
+        IfBossThenPants:ProcessQueue()
 
     elseif event == "PLAYER_ENTERING_WORLD" then
         IfBossThenPants.inCombat = UnitAffectingCombat("player") and true or false
@@ -526,6 +657,7 @@ local function EventHandler()
         frame:RegisterEvent("PLAYER_REGEN_ENABLED")
         frame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
         frame:RegisterEvent("PLAYER_TARGET_CHANGED")
+        frame:RegisterEvent("PLAYER_UNGHOST")
         
     elseif event == "ADDON_LOADED" and arg1 == "IfBossThenPants" then
         IfBossThenPants:InitializeDB()

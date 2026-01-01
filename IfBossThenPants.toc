@@ -2,7 +2,7 @@
 ## Title: IfBossThenPants
 ## Notes: Auto-queues gear changes on specific events.
 ## Author: Abstractz
-## Version: 1.2
+## Version: 1.3.4
 ## SavedVariablesPerCharacter: IfBossThenPantsDB
 
 IfBossThenPants.lua

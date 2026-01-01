@@ -3,11 +3,15 @@
 ## What is it?
 A mob-event-based gear automation addon for World of Warcraft 1.12.1. It automates equipment swapping based on specific combat triggers, supporting both standard clients (Name matching) and SuperWoW clients (GUID matching).
 
+It supports equipping **Individual Items** or full **Gear Sets** via integration with **ItemRack** and **Outfitter**.
+
 ## What does it do?
-It monitors **Mob Death** and **Target Change** events. When a matching Mob Name or GUID is detected, it equips specified items to specified slots.
-*   **In Combat:** The swap is usually queued and executes immediately upon leaving combat. **Exception:** Weapons (Main/Off/Ranged) can be forced to swap during combat using the optional combat flag.
+It monitors **Mob Death** and **Target Change** events. When a matching Mob Name or GUID is detected, it equips specified items or sets.
+*   **In Combat:** The swap is usually queued and executes immediately upon leaving combat.
+    *   *Exception:* Individual Weapons (Main/Off/Ranged) can be forced to swap during combat using the optional combat flag.
+    *   *Note:* Full Gear Sets are **always** queued until combat ends.
+*   **While Dead/Ghost:** Swaps are queued and execute immediately upon resurrection.
 *   **Out of Combat:** The swap happens instantly.
-*   **Optimization:** It checks equipped items first. If the item is already in the correct slot, no action is taken.
 
 ## Use Cases
 *   **Resistance Gear:** Automatically equip resistance items when targeting specific mobs.
@@ -40,34 +44,39 @@ When adding rules, you must identify the mob. You can do this in three ways:
 ### 3. Scenario A: Swap on Death
 Triggers when the mob dies. Useful for equipping regen gear after a boss or swapping trinkets between trash packs.
 
-```bash
-# Syntax
-/ibtp adddeath [Identifier] - [Item Name] - [Slot (Optional)]
+**Syntax:** `/ibtp adddeath [Identifier] - [Content] - [Slot (Optional)]`
 
-# Example: Equip "Carrot on a Stick" to trinket slot 1 (13) when Ragnaros dies
+```bash
+# Example 1: Equip "Carrot on a Stick" to trinket slot 1 (13) when Ragnaros dies
 /ibtp adddeath Ragnaros - Carrot on a Stick - 13
 
-# Example (SuperWoW): Target a specific mob and equip "Hand of Justice" when it dies
+# Example 2: Equip an ItemRack set named "SpeedSet" when Ragnaros dies
+/ibtp adddeath Ragnaros - ItemRack(SpeedSet)
+
+# Example 3 (SuperWoW): Target a specific mob and equip "Hand of Justice" when it dies
 /ibtp adddeath target - Hand of Justice
 ```
 
 ### 4. Scenario B: Swap on Target
 Triggers immediately when you click or tab to a specific unit.
 
-```bash
-# Syntax
-/ibtp addtarget [Identifier] - [Item Name] - [Slot (Optional)]
+**Syntax:** `/ibtp addtarget [Identifier] - [Content] - [Slot (Optional)]`
 
-# Example: Equip "Draconian Deflector" to Offhand when targeting "Baron Geddon"
+```bash
+# Example 1: Equip "Draconian Deflector" to Offhand when targeting "Baron Geddon"
 /ibtp addtarget Baron Geddon - Draconian Deflector - 17
+
+# Example 2: Equip an Outfitter set named "FireResist" when targeting "Baron Geddon"
+/ibtp addtarget Baron Geddon - Outfitter(FireResist)
 ```
 
 ### 5. In-Combat Weapon Swapping (Optional)
-By default, the addon queues swaps until you leave combat. You can force an **immediate** swap during combat by adding `- combat` to the end of the command.
+By default, the addon queues swaps until you leave combat or resurrect. You can force an **immediate** swap during combat by adding `- combat` to the end of the command.
 
 **Restrictions:**
 *   You must specify the slot ID.
 *   The slot ID must be **16** (Main Hand), **17** (Off Hand/Shield), or **18** (Ranged).
+*   **Gear Sets cannot be swapped in combat.**
 
 ```bash
 # Syntax
@@ -75,9 +84,6 @@ By default, the addon queues swaps until you leave combat. You can force an **im
 
 # Example: Equip "Thunderfury" immediately when Ragnaros dies, even if in combat
 /ibtp adddeath Ragnaros - Thunderfury - 16 - combat
-
-# Example: Equip "Elementium Reinforced Bulwark" immediately when targeting Baron Geddon
-/ibtp addtarget Baron Geddon - Elementium Reinforced Bulwark - 17 - combat
 ```
 
 ### 6. Removal
@@ -85,31 +91,58 @@ By default, the addon queues swaps until you leave combat. You can force an **im
 ```bash
 # Remove a rule (Must match the Name/GUID exactly as listed)
 /ibtp remdeath Ragnaros - Carrot on a Stick
-/ibtp remtarget Baron Geddon - Draconian Deflector
+/ibtp remdeath Ragnaros - ItemRack(SpeedSet)
 ```
+
+## ⚠️ Important: Mixing Sets & Items
+You can theoretically assign a Gear Set **and** a specific Item to the same event, but **this is not recommended due to GCD issues.**
+
+If you mix them:
+1.  The Addon will attempt to equip the **Set** first.
+2.  It will then attempt to equip the **Individual Item**.
 
 ## Advanced: Manual Configuration
 You can edit the database directly by closing the game and opening: `WTF\Account\<AccName>\<ServerName>\<CharName>\SavedVariables\IfBossThenPants.lua`.
+
+**Note:** New fields (`type` and `addon`) were added in v1.3 to support Gear Sets.
 
 ```lua
 IfBossThenPantsDB = {
     ["enabled"] = true,
     ["onMobDeath"] = {
+        -- Example 1: Standard Item (Name match)
         ["ragnaros"] = {
-            { ["name"] = "Carrot on a Stick", ["slot"] = 13 }
+            { 
+                ["name"] = "Carrot on a Stick", 
+                ["slot"] = 13, 
+                ["combat"] = false 
+            }
+        },
+        -- Example 2: ItemRack Set (GUID match)
+        ["0xf1300021560167f6"] = {
+            { 
+                ["name"] = "SpeedSet", 
+                ["type"] = "set", 
+                ["addon"] = "itemrack", 
+                ["combat"] = false 
+            }
         }
     },
     ["onTarget"] = {
-        ["0xf130008f5e026920"] = { -- SuperWoW GUID example
-            -- Note the combat flag here
-            { ["name"] = "Draconian Deflector", ["slot"] = 17, ["combat"] = true }
+        -- Example 3: Combat Weapon Swap (GUID match)
+        ["0xf130008f5e026920"] = { 
+            { 
+                ["name"] = "Thunderfury", 
+                ["slot"] = 16, 
+                ["combat"] = true 
+            }
         }
     }
 }
 ```
 
 ## Slot IDs
-You can use the slot number ID or the alias.
+You can use the slot number ID or the alias. Note that Slot IDs are ignored when equipping full Sets.
 
 | Slot Name | ID | Alias | Combat Swap? |
 | :--- | :--- | :--- | :--- |
